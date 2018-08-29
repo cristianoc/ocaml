@@ -347,6 +347,30 @@ let extract_concrete_record env ty =
     (p0, p, {type_kind=Type_record (fields, _)}) -> (p0, p, fields)
   | _ -> raise Not_found
 
+let rec remove_option_type env ty =
+  try
+    let option_type_arg = extract_option_type env ty in
+    remove_option_type env option_type_arg
+  with
+    | _ -> ty
+
+let unwrap_option_type env ty =
+  let res =  {ty with exp_type = remove_option_type env ty.exp_type} in
+  let modified = not (ty.exp_type == res.exp_type) in
+  res, modified
+
+let wrap_option_type env modified ty =
+  if modified
+  then
+    let field_has_option_type =
+      try
+        let _ = extract_option_type env ty in
+        true
+      with _ ->
+        false in
+   if field_has_option_type then ty else type_option ty
+  else ty
+
 let extract_concrete_variant env ty =
   match extract_concrete_typedecl env ty with
     (p0, p, {type_kind=Type_variant cstrs}) -> (p0, p, cstrs)
@@ -2600,17 +2624,17 @@ and type_expect_
         exp_attributes = sexp.pexp_attributes;
         exp_env = env }
   | Pexp_field(srecord, lid) ->
-      let (record, label, _) = type_label_access env srecord lid in
+      let (record, label, _, modified) = type_label_access env srecord lid in
       let (_, ty_arg, ty_res) = instance_label false label in
       unify_exp env record ty_res;
       rue {
         exp_desc = Texp_field(record, lid, label);
         exp_loc = loc; exp_extra = [];
-        exp_type = ty_arg;
+        exp_type = wrap_option_type env modified ty_arg;
         exp_attributes = sexp.pexp_attributes;
         exp_env = env }
   | Pexp_setfield(srecord, lid, snewval) ->
-      let (record, label, opath) = type_label_access env srecord lid in
+      let (record, label, opath, _modified) = type_label_access env srecord lid in
       let ty_record = if opath = None then newvar () else record.exp_type in
       let (label_loc, label, newval) =
         type_label_exp false env loc ty_record (lid, label, snewval) in
@@ -3288,7 +3312,8 @@ and type_function ?in_function loc attrs env ty_expected_explained l caselist =
 
 and type_label_access env srecord lid =
   if !Clflags.principal then begin_def ();
-  let record = type_exp ~recarg:Allowed env srecord in
+  let record_ = type_exp ~recarg:Allowed env srecord in
+  let record, modified = unwrap_option_type env record_ in
   if !Clflags.principal then begin
     end_def ();
     generalize_structure record.exp_type
@@ -3304,7 +3329,7 @@ and type_label_access env srecord lid =
   let label =
     wrap_disambiguate "This expression has" (mk_expected ty_exp)
       (Label.disambiguate lid env opath) labels in
-  (record, label, opath)
+  (record, label, opath, modified)
 
 (* Typing format strings for printing or reading.
    These formats are used by functions in modules Printf, Format, and Scanf.
