@@ -347,29 +347,78 @@ let extract_concrete_record env ty =
     (p0, p, {type_kind=Type_record (fields, _)}) -> (p0, p, fields)
   | _ -> raise Not_found
 
-let rec remove_option_type env ty =
+let type_remove_option env ty =
   try
-    let option_type_arg = extract_option_type env ty in
-    remove_option_type env option_type_arg
-  with
-    | _ -> ty
+    Some (extract_option_type env ty)
+  with _ ->
+    None
 
-let unwrap_option_type env ty =
-  let res =  {ty with exp_type = remove_option_type env ty.exp_type} in
-  let modified = not (ty.exp_type == res.exp_type) in
-  res, modified
+let mkpat pat_desc pat_loc pat_type pat_env =
+  let pat_extra = [] in
+  { pat_desc; pat_loc; pat_extra; pat_type; pat_env; pat_attributes = [] }
 
-let wrap_option_type env modified ty =
-  if modified
-  then
-    let field_has_option_type =
-      try
-        let _ = extract_option_type env ty in
-        true
-      with _ ->
-        false in
-   if field_has_option_type then ty else type_option ty
-  else ty
+let type_has_option_type env ty =
+  try
+    let _ = extract_option_type env ty in
+    true
+  with _ ->
+    false
+
+let type_wrap_option env ty =
+  if type_has_option_type env ty then ty else type_option ty
+
+let exp_unwrap_option env exp =
+  match type_remove_option env exp.exp_type with
+  | None ->
+    exp, None
+  | Some(exp_type_noopt) ->
+    let mkunwrap getField rue field_type =
+      let result_type = type_wrap_option env field_type in
+      let case_none =
+        let lid = Longident.Lident "None" in
+        let cnone = Env.lookup_constructor lid env in  
+        let pat_desc = Tpat_construct(mknoloc lid, cnone, []) in
+        let pattern = mkpat pat_desc exp.exp_loc exp.exp_type env in
+        {
+          c_lhs = pattern;
+          c_guard = None;
+          c_rhs = option_none result_type exp.exp_loc;
+        } in
+      let case_some =
+        let lid = Longident.Lident "Some" in
+        let csome = Env.lookup_constructor lid env in
+        let idname = "x" in
+        let strloc = mknoloc idname in
+        let ident = Ident.create strloc.txt in
+        let pat_id =
+          let pat_desc = Tpat_var (ident, strloc) in
+          mkpat pat_desc exp.exp_loc exp.exp_type env in
+        let exp_id =
+          let exp_desc =
+            let lid = mknoloc (Longident.Lident idname) in
+            let path = Path.Pident ident in
+            let desc =
+              { val_type = exp_type_noopt;
+                val_kind = Val_reg;
+                val_attributes = [];
+                val_loc = Location.none } in
+            Texp_ident (path, lid, desc) in
+          let exp_type_id = exp_type_noopt in
+          mkexp exp_desc exp_type_id exp.exp_loc env in
+        let pat_desc = Tpat_construct(mknoloc lid, csome, [pat_id]) in
+        let pattern = mkpat pat_desc exp.exp_loc exp.exp_type env in
+        {
+          c_lhs = pattern;
+          c_guard = None;
+          c_rhs =
+            if type_has_option_type env field_type
+            then rue (getField exp_id)
+            else rue (option_some (getField exp_id));
+        } in
+      let cases = [case_none; case_some] in
+      let exp_desc = Texp_match(exp, cases, Total) in
+      {exp with exp_desc; exp_type = result_type} in
+    {exp with exp_type=exp_type_noopt}, Some mkunwrap
 
 let extract_concrete_variant env ty =
   match extract_concrete_typedecl env ty with
@@ -2624,17 +2673,24 @@ and type_expect_
         exp_attributes = sexp.pexp_attributes;
         exp_env = env }
   | Pexp_field(srecord, lid) ->
-      let (record, label, _, modified) = type_label_access env srecord lid in
+      let (record, label, _, mkunwrap_opt) = type_label_access env srecord lid in
       let (_, ty_arg, ty_res) = instance_label false label in
       unify_exp env record ty_res;
-      rue {
-        exp_desc = Texp_field(record, lid, label);
-        exp_loc = loc; exp_extra = [];
-        exp_type = wrap_option_type env modified ty_arg;
-        exp_attributes = sexp.pexp_attributes;
-        exp_env = env }
+      let get_field exp =
+        { exp_desc = Texp_field(exp, lid, label);
+          exp_loc = loc; exp_extra = [];
+          exp_type = ty_arg;
+          exp_attributes = sexp.pexp_attributes;
+          exp_env = env } in
+      begin
+        match mkunwrap_opt with
+        | None ->
+          rue (get_field record)
+        | Some mkunwrap ->
+          mkunwrap get_field rue ty_arg
+      end
   | Pexp_setfield(srecord, lid, snewval) ->
-      let (record, label, opath, _modified) = type_label_access env srecord lid in
+      let (record, label, opath, _mkunwrap_opt) = type_label_access env srecord lid in
       let ty_record = if opath = None then newvar () else record.exp_type in
       let (label_loc, label, newval) =
         type_label_exp false env loc ty_record (lid, label, snewval) in
@@ -3313,7 +3369,7 @@ and type_function ?in_function loc attrs env ty_expected_explained l caselist =
 and type_label_access env srecord lid =
   if !Clflags.principal then begin_def ();
   let record_ = type_exp ~recarg:Allowed env srecord in
-  let record, modified = unwrap_option_type env record_ in
+  let record, mkunwrap_opt = exp_unwrap_option env record_ in
   if !Clflags.principal then begin
     end_def ();
     generalize_structure record.exp_type
@@ -3329,7 +3385,7 @@ and type_label_access env srecord lid =
   let label =
     wrap_disambiguate "This expression has" (mk_expected ty_exp)
       (Label.disambiguate lid env opath) labels in
-  (record, label, opath, modified)
+  (record, label, opath, mkunwrap_opt)
 
 (* Typing format strings for printing or reading.
    These formats are used by functions in modules Printf, Format, and Scanf.
